@@ -1,5 +1,5 @@
 import parsley.Parsley
-import parsley.combinator.{option, sepBy1}
+import parsley.combinator.{option, sepBy, sepBy1}
 import parsley.expr.chain
 import parsley.token.Lexer
 import parsley.token.descriptions.text.{EscapeDesc, TextDesc}
@@ -13,6 +13,10 @@ object SqlParser {
   case class NumberLit(value: Double) extends Expression
   case class StringLit(value: String) extends Expression
   case class SubqueryExpr(select: SelectStatement) extends Expression
+
+  // SQL Aggregation Function
+  case class AggregationFunction(name: String, args: List[Expression]) extends Expression
+  case object Star extends Expression  // Special * expression for COUNT(*)
 
   sealed trait BinaryOp extends Expression {
     def left: Expression
@@ -63,7 +67,8 @@ object SqlParser {
                               withClause: Option[WithClause],
                               projection: Projection,
                               from: TableRef,
-                              where: Option[Expression]
+                              where: Option[Expression],
+                              groupBy: Option[List[Expression]]
                             )
 
   private val lexicalDesc = LexicalDesc.plain.copy(
@@ -72,7 +77,7 @@ object SqlParser {
       identifierLetter = Basic(c => c.isLetterOrDigit || c == '$' || c == '_' || c == '.')),
     symbolDesc = SymbolDesc.plain.copy(
       hardKeywords =
-        Set("WITH", "SELECT", "FROM", "AS", "WHERE", "GROUP BY", "HAVING") ++
+        Set("WITH", "SELECT", "FROM", "AS", "WHERE", "GROUP", "BY", "HAVING") ++
           Set("CROSS", "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "JOIN", "ON", "UNION") ++
           Set("OR", "AND", "NOT", "IN", "IS", "REGEX", "NULL") ++
           Set("TRUE", "FALSE"),
@@ -111,6 +116,7 @@ object SqlParser {
   private val TRUE = lexer.lexeme.symbol("TRUE")
   private val FALSE = lexer.lexeme.symbol("FALSE")
   private val REGEX = lexer.lexeme.symbol("REGEX")
+  private val GROUP_BY = lexer.lexeme.symbol("GROUP") *> lexer.lexeme.symbol("BY")
 
   // Operators
   private val EQUALS = lexer.lexeme.symbol("=")
@@ -134,8 +140,25 @@ object SqlParser {
   private lazy val stringLit: Parsley[Expression] =
     STRING.map(StringLit)
 
-  private lazy val columnRef: Parsley[Expression] =
-    IDENTIFIER.map(ColumnRef)
+  private lazy val identifierExpr: Parsley[Expression] =
+    IDENTIFIER.flatMap { id =>
+      // Try to parse Aggregation Function call - lookAhead to check for LPAREN without consuming it
+      Parsley.lookAhead(LPAREN).flatMap { _ =>
+        (LPAREN *> functionArgs <* RPAREN).map(args => AggregationFunction(id, args))
+      }.|(Parsley.pure(ColumnRef(id)))
+    }
+
+  // Special star (*) parser for function arguments like COUNT(*)
+  private lazy val star: Parsley[Expression] =
+    MULTIPLY.map(_ => Star)
+
+  // Function arguments parser
+  private lazy val functionArgs: Parsley[List[Expression]] = {
+    val emptyArgs = Parsley.pure(List.empty[Expression])
+    val starArg = star.map(List(_)) // COUNT(*)
+    val regularArgs = sepBy(expr, COMMA)
+    starArg | regularArgs | emptyArgs
+  }
 
   // Expression parsers with precedence hierarchy
   private lazy val expr: Parsley[Expression] = orExpr
@@ -152,7 +175,7 @@ object SqlParser {
   private lazy val inExpr: Parsley[Expression] = {
     def inList: Parsley[Either[List[Expression], SubqueryExpr]] =
       LPAREN *> (selectStmt.map(stmt => Right(SubqueryExpr(stmt))) |
-          sepBy1(expr, COMMA).map(Left(_))) <* RPAREN
+        sepBy1(expr, COMMA).map(Left(_))) <* RPAREN
 
     isTrueExpr.flatMap { expr =>
       (IN *> inList.map(values => In(expr, values))) | Parsley.pure(expr)
@@ -204,21 +227,14 @@ object SqlParser {
         DIVIDE.map(_ => (l: Expression, r: Expression) => Divide(l, r))
     )
 
-  //  private lazy val atomExpr: Parsley[Expression] =  //  WRONG.
-  //    numberLit | stringLit | subqueryExpr | columnRef |
-  //      LPAREN *> expr <* RPAREN
-  private lazy val atomExpr: Parsley[Expression] =  // FIXED
-    numberLit | stringLit | columnRef | LPAREN *> expr <* RPAREN | subqueryExpr
+  // Updated atomExpr to use the new identifierExpr that handles both column refs and function calls
+  private lazy val atomExpr: Parsley[Expression] =
+    numberLit | stringLit | identifierExpr | LPAREN *> expr <* RPAREN | subqueryExpr
 
   private lazy val subqueryExpr: Parsley[Expression] =
     (LPAREN *> selectStmt <* RPAREN).map(SubqueryExpr)
 
-  //CTE parser
-  //  WITH
-  //  t1 AS (SELECT * FROM table1),
-  //  t2 AS (SELECT * FROM table2),
-  //  t3 AS (SELECT * FROM t1 JOIN t2)
-  //  SELECT * FROM t3
+  // CTE parser
   private lazy val cte: Parsley[CTE] = for {
     name <- IDENTIFIER
     _ <- AS
@@ -227,9 +243,9 @@ object SqlParser {
     _ <- RPAREN
   } yield CTE(name, query)
 
-  private lazy val withClause: Parsley[WithClause] =  for {
+  private lazy val withClause: Parsley[WithClause] = for {
     _ <- WITH
-    ctes <-  sepBy1(cte, COMMA)
+    ctes <- sepBy1(cte, COMMA)
   } yield WithClause(ctes)
 
   // Projection parsers
@@ -258,15 +274,20 @@ object SqlParser {
     subquery | simpleTable
   }
 
+  private lazy val groupByClause: Parsley[List[Expression]] = for {
+    _ <- GROUP_BY
+    exprs <- sepBy1(expr, COMMA)
+  } yield exprs
 
   private lazy val selectStmt: Parsley[SelectStatement] = for {
     withOpt <- option(withClause)
-    _       <- SELECT
-    proj    <- projection
-    _       <- FROM
-    table   <- tableRef
-    where   <- option(WHERE *> expr)
-  } yield SelectStatement(withOpt, proj, table, where)
+    _ <- SELECT
+    proj <- projection
+    _ <- FROM
+    table <- tableRef
+    where <- option(WHERE *> expr)
+    groupBy <- option(groupByClause)
+  } yield SelectStatement(withOpt, proj, table, where, groupBy)
 
   def parse(input: String): Either[String, SelectStatement] =
     selectStmt.parse(input).toEither

@@ -1,4 +1,3 @@
-# CLAUDE.md - Compositional SQL Parser With Parsley
 
 ## Build & Test Commands
 - Compile: `sbt compile`

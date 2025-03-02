@@ -160,7 +160,7 @@ class SqlParserSpec extends AnyWordSpec with Matchers {
       }
 
       "using complex nested conditions" in {
-        val input = "SELECT * FROM users WHERE ( status = 'active' AND age > 18) OR role = 'admin'"
+        val input = "Select * FROM users WHERE ( status = 'active' AND age > 18) OR role = 'admin'"
         val result = SqlParser.parse(input)
         verifyResult(result)
 
@@ -276,6 +276,123 @@ class SqlParserSpec extends AnyWordSpec with Matchers {
             subquery.from shouldBe TableName("orders")
           case _ => fail("Expected IN condition with subquery")
         }
+      }
+    }
+
+    "parse GROUP BY statements" when {
+      "using a single column" in {
+        val input = "SELECT id, count(*) FROM users Group By id"
+        val result = SqlParser.parse(input)
+        verifyResult(result)
+
+        val stmt = result.right.get
+        stmt.groupBy shouldBe defined
+        val groupByCols = stmt.groupBy.get
+        groupByCols should have size 1
+        groupByCols.head shouldBe ColumnRef("id")
+      }
+
+      "using multiple columns" in {
+        val input = "SELECT department, role, avg(salary) FROM employees GROUP BY department, role"
+        val result = SqlParser.parse(input)
+        verifyResult(result)
+
+        val stmt = result.right.get
+        stmt.groupBy shouldBe defined
+        val groupByCols = stmt.groupBy.get
+        groupByCols should have size 2
+        groupByCols(0) shouldBe ColumnRef("department")
+        groupByCols(1) shouldBe ColumnRef("role")
+      }
+
+      "with case-insensitive GROUP BY keywords" in {
+        val input = "SELECT department, count(*) FROM employees group by department"
+        val result = SqlParser.parse(input)
+        verifyResult(result)
+
+        val stmt = result.right.get
+        stmt.groupBy shouldBe defined
+        val groupByCols = stmt.groupBy.get
+        groupByCols should have size 1
+        groupByCols.head shouldBe ColumnRef("department")
+      }
+
+      "with whitespace variations" in {
+        val input = """SELECT department, count(*)
+                      |FROM   employees
+                      |GROUP  BY    department""".stripMargin
+        val result = SqlParser.parse(input)
+        verifyResult(result)
+
+        val stmt = result.right.get
+        stmt.groupBy shouldBe defined
+        val groupByCols = stmt.groupBy.get
+        groupByCols should have size 1
+        groupByCols.head shouldBe ColumnRef("department")
+      }
+
+      "with expressions in GROUP BY" in {
+        val input = "SELECT year, sum(revenue) FROM sales GROUP BY year + 1"
+        val result = SqlParser.parse(input)
+        verifyResult(result)
+
+        val stmt = result.right.get
+        stmt.groupBy shouldBe defined
+        val groupByCols = stmt.groupBy.get
+        groupByCols should have size 1
+        groupByCols.head shouldBe a[Add]
+        val addExpr = groupByCols.head.asInstanceOf[Add]
+        addExpr.left shouldBe ColumnRef("year")
+        addExpr.right shouldBe NumberLit(1)
+      }
+
+      "with WHERE clause and GROUP BY" in {
+        val input = "SELECT region, SUM(sales) FROM transactions WHERE year = 2023 GROUP BY region"
+        val result = SqlParser.parse(input)
+        verifyResult(result)
+
+        val stmt = result.right.get
+        stmt.where shouldBe defined
+        stmt.where.get shouldBe Equals(ColumnRef("year"), NumberLit(2023))
+
+        stmt.groupBy shouldBe defined
+        val groupByCols = stmt.groupBy.get
+        groupByCols should have size 1
+        groupByCols.head shouldBe ColumnRef("region")
+      }
+
+      "with GROUP BY in subquery" in {
+        val input = """WITH dept_stats AS (
+                      |  SELECT department, COUNT(*) as employee_count
+                      |  FROM employees
+                      |  GROUP BY department
+                      |)
+                      |SELECT * FROM dept_stats""".stripMargin
+        val result = SqlParser.parse(input)
+        verifyResult(result)
+
+        val stmt = result.right.get
+        stmt.withClause shouldBe defined
+        val cte = stmt.withClause.get.ctes.head
+
+        cte.query.groupBy shouldBe defined
+        val groupByCols = cte.query.groupBy.get
+        groupByCols should have size 1
+        groupByCols.head shouldBe ColumnRef("department")
+      }
+
+      "with no GROUP BY clause" in {
+        val input = "SELECT id, name FROM users"
+        val result = SqlParser.parse(input)
+        verifyResult(result)
+
+        val stmt = result.right.get
+        stmt.groupBy shouldBe None
+      }
+
+      "failing with incomplete GROUP BY" in {
+        val input = "SELECT dept, COUNT(*) FROM employees GROUP BY"
+        SqlParser.parse(input) shouldBe a[Left[_, _]]
       }
     }
 
